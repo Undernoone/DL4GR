@@ -118,6 +118,33 @@ python3 experiments/curved_cnn_demo.py \
   --plot outputs/cifar10_v3_strong_seed7.png
 ```
 
+Fast GPU run:
+
+```bash
+python3 experiments/curved_cnn_demo.py \
+  --dataset cifar10 \
+  --device cuda \
+  --epochs 50 \
+  --batch-size 512 \
+  --feature-dim 128 \
+  --models residual,geometric-flow,geometric-flow-v3 \
+  --curvature-reg 0.00005 \
+  --metric-reg 0.000005 \
+  --scheduler cosine \
+  --label-smoothing 0.05 \
+  --grad-clip 1.0 \
+  --ema-decay 0.999 \
+  --amp fp16 \
+  --channels-last \
+  --num-workers 4 \
+  --pin-memory \
+  --tf32 \
+  --fast \
+  --seed 7 \
+  --metrics-json outputs/cifar10_v3_fast_seed7.json \
+  --plot outputs/cifar10_v3_fast_seed7.png
+```
+
 Run several seeds for a stronger claim:
 
 ```bash
@@ -140,6 +167,17 @@ By default, public training datasets use light augmentation. For CIFAR10 this
 means random crop plus horizontal flip. Use `--no-augment` for an ablation.
 Runs also use cosine learning-rate decay and label smoothing by default; use
 `--scheduler none` or `--label-smoothing 0.0` for ablations.
+
+Speed options:
+
+- `--amp fp16` or `--amp bf16`: mixed precision.
+- `--channels-last`: faster CUDA convolution memory layout on many GPUs.
+- `--num-workers 4 --pin-memory`: faster data loading and host-to-device copy.
+- `--tf32`: allow TensorFloat-32 matmul/convolution on supported NVIDIA GPUs.
+- `--fast`: disable strict deterministic CUDA behavior and enable cuDNN
+  benchmarking. This is faster but not bitwise reproducible.
+- `--compile`: optional `torch.compile`; it may speed long runs but has startup
+  overhead.
 
 Geometric-flow runs print extra diagnostics:
 

@@ -12,6 +12,7 @@ The script supports synthetic data plus public torchvision datasets.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import json
 import math
 import os
@@ -725,6 +726,38 @@ def set_seed(seed: int, deterministic: bool = True) -> None:
         torch.use_deterministic_algorithms(True, warn_only=True)
 
 
+def configure_performance(device: torch.device, args: argparse.Namespace) -> None:
+    if device.type != "cuda":
+        return
+
+    if args.fast:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        torch.use_deterministic_algorithms(False)
+
+    if args.tf32 or args.fast:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+
+
+def resolve_amp_dtype(device: torch.device, amp: str) -> Optional[torch.dtype]:
+    if amp == "none" or device.type not in {"cuda", "cpu"}:
+        return None
+    if amp == "fp16":
+        return torch.float16 if device.type == "cuda" else None
+    if amp == "bf16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported amp mode: {amp}")
+
+
+def autocast_context(device: torch.device, amp_dtype: Optional[torch.dtype]):
+    if amp_dtype is None:
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=amp_dtype)
+
+
 def seed_worker(worker_id: int) -> None:
     worker_seed = torch.initial_seed() % 2**32
     random.seed(worker_seed)
@@ -776,11 +809,15 @@ def run_epoch(
     loader: DataLoader,
     optimizer: Optional[torch.optim.Optimizer],
     device: torch.device,
+    amp_dtype: Optional[torch.dtype] = None,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
     label_smoothing: float = 0.0,
     curvature_reg: float = 0.0,
     metric_reg: float = 0.0,
     grad_clip: float = 0.0,
     ema: Optional[ModelEMA] = None,
+    channels_last: bool = False,
+    non_blocking: bool = False,
 ) -> EpochStats:
     training = optimizer is not None
     model.train(training)
@@ -792,23 +829,34 @@ def run_epoch(
     diagnostic_sums: Dict[str, float] = {}
 
     for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
+        x = x.to(device, non_blocking=non_blocking)
+        y = y.to(device, non_blocking=non_blocking)
+        if channels_last and x.ndim == 4:
+            x = x.contiguous(memory_format=torch.channels_last)
 
         with torch.set_grad_enabled(training):
-            logits = model(x)
-            ce_loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
-            reg_loss = ce_loss.new_zeros(())
-            if training and hasattr(model, "geometric_regularization"):
-                reg_loss = model.geometric_regularization(curvature_reg, metric_reg)
-            loss = ce_loss + reg_loss
+            with autocast_context(device, amp_dtype):
+                logits = model(x)
+                ce_loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
+                reg_loss = ce_loss.new_zeros(())
+                if training and hasattr(model, "geometric_regularization"):
+                    reg_loss = model.geometric_regularization(curvature_reg, metric_reg)
+                loss = ce_loss + reg_loss
 
         if training:
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                if grad_clip > 0.0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
             if ema is not None:
                 ema.update(model)
 
@@ -846,9 +894,17 @@ def train_model(
     metric_reg: float,
     grad_clip: float,
     ema_decay: float,
+    amp: str,
+    channels_last: bool,
+    compile_model: bool,
+    non_blocking: bool,
     device: torch.device,
 ) -> List[Dict[str, float]]:
     model.to(device)
+    if channels_last and device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+    if compile_model:
+        model = torch.compile(model)
     params = count_parameters(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = (
@@ -857,25 +913,46 @@ def train_model(
         else None
     )
     ema = ModelEMA(model, ema_decay) if ema_decay > 0.0 else None
+    amp_dtype = resolve_amp_dtype(device, amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=(amp == "fp16" and device.type == "cuda"))
+    scaler = scaler if scaler.is_enabled() else None
     history: List[Dict[str, float]] = []
 
     print(f"\n== {name} ==")
     print(f"parameters: {params:,}")
+    if amp_dtype is not None:
+        print(f"amp: {amp}")
+    if channels_last and device.type == "cuda":
+        print("memory format: channels_last")
+    if compile_model:
+        print("torch.compile: enabled")
     for epoch in range(1, epochs + 1):
         train = run_epoch(
             model,
             train_loader,
             optimizer,
             device,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
             label_smoothing=label_smoothing,
             curvature_reg=curvature_reg,
             metric_reg=metric_reg,
             grad_clip=grad_clip,
             ema=ema,
+            channels_last=channels_last,
+            non_blocking=non_blocking,
         )
         if ema is not None:
             ema.apply_to(model)
-        test = run_epoch(model, test_loader, None, device)
+        test = run_epoch(
+            model,
+            test_loader,
+            None,
+            device,
+            amp_dtype=amp_dtype,
+            channels_last=channels_last,
+            non_blocking=non_blocking,
+        )
         if ema is not None:
             ema.restore(model)
         current_lr = optimizer.param_groups[0]["lr"]
@@ -1090,21 +1167,27 @@ def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader, Dat
 
     train_generator = torch.Generator().manual_seed(args.seed + 202)
     test_generator = torch.Generator().manual_seed(args.seed + 303)
+    loader_kwargs = {
+        "num_workers": args.num_workers,
+        "worker_init_fn": seed_worker,
+        "pin_memory": args.pin_memory,
+        "persistent_workers": args.num_workers > 0,
+    }
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        worker_init_fn=seed_worker,
         generator=train_generator,
+        **loader_kwargs,
     )
     test_loader = DataLoader(
         test_set,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        worker_init_fn=seed_worker,
         generator=test_generator,
+        **loader_kwargs,
     )
     return train_loader, test_loader, config
 
@@ -1148,6 +1231,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--seeds", type=str, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--amp", type=str, default="none", choices=["none", "fp16", "bf16"])
+    parser.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--fast",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable faster CUDA settings at the cost of strict determinism.",
+    )
     parser.add_argument("--plot", type=str, default=None)
     parser.add_argument("--metrics-json", type=str, default=None)
     parser.add_argument(
@@ -1219,13 +1314,17 @@ def print_summary(results: Dict[str, List[Dict[str, float]]]) -> None:
 def main() -> None:
     args = parse_args()
     device = choose_device(args.device)
+    configure_performance(device, args)
+    print(f"device: {device}")
+    if device.type == "cuda":
+        print(f"gpu: {torch.cuda.get_device_name(device)}")
 
     results = {}
     seed_values = parse_seed_values(args.seed, args.seeds)
     for seed in seed_values:
         args.seed = seed
         for name, model_cls in selected_model_builders(args.models).items():
-            set_seed(seed)
+            set_seed(seed, deterministic=not args.fast)
             train_loader, test_loader, data_config = build_loaders(args)
             result_name = f"{name} seed={seed}" if len(seed_values) > 1 else name
             results[result_name] = train_model(
@@ -1246,6 +1345,10 @@ def main() -> None:
                 metric_reg=args.metric_reg,
                 grad_clip=args.grad_clip,
                 ema_decay=args.ema_decay,
+                amp=args.amp,
+                channels_last=args.channels_last,
+                compile_model=args.compile,
+                non_blocking=args.pin_memory and device.type == "cuda",
                 device=device,
             )
 
