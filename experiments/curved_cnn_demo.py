@@ -541,6 +541,170 @@ class GeometricFlowCNNV2(nn.Module):
         }
 
 
+class AdaptiveGeometricFlowBlock(nn.Module):
+    """Adaptive blend of residual, metric, and curvature propagation.
+
+    V2 made the geometry richer but heavier. This block keeps the useful V1
+    idea, then lets the input choose how much ordinary residual motion,
+    metric-scaled motion, and curvature-guided motion to use.
+    """
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        hidden = max(16, channels // 4)
+        self.vector_field = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.metric = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=1),
+        )
+        self.curvature = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels),
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.Tanh(),
+        )
+        self.mixer = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden, kernel_size=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, 3, kernel_size=1),
+        )
+        self.step_logit = nn.Parameter(torch.tensor(-2.0))
+        self.curvature_logit = nn.Parameter(torch.tensor(-2.4))
+        self.out_norm = nn.BatchNorm2d(channels)
+        self.out_act = nn.SiLU(inplace=True)
+        self.register_buffer(
+            "laplacian_kernel",
+            torch.tensor(
+                [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+                dtype=torch.float32,
+            ).view(1, 1, 3, 3),
+        )
+
+        self.current_metric: Optional[Tensor] = None
+        self.current_curvature: Optional[Tensor] = None
+        self.last_stats: Dict[str, float] = {}
+
+    def forward(self, x: Tensor) -> Tensor:
+        vector = self.vector_field(x)
+
+        metric = F.softplus(self.metric(x)) + 1e-4
+        metric = metric / metric.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-4)
+        curvature = self.curvature(x)
+
+        kernel = self.laplacian_kernel.to(dtype=x.dtype).repeat(x.size(1), 1, 1, 1)
+        laplacian = F.conv2d(x, kernel, padding=1, groups=x.size(1))
+        curvature_scale = torch.sigmoid(self.curvature_logit)
+        curvature_flow = curvature_scale * curvature * torch.tanh(laplacian)
+
+        weights = torch.softmax(self.mixer(x), dim=1)
+        residual_weight = weights[:, 0:1]
+        metric_weight = weights[:, 1:2]
+        curvature_weight = weights[:, 2:3]
+        update = (
+            residual_weight * vector
+            + metric_weight * metric * vector
+            + curvature_weight * curvature_flow
+        )
+        step = torch.sigmoid(self.step_logit)
+
+        self.current_metric = metric
+        self.current_curvature = curvature
+        self.last_stats = {
+            "metric_mean": float(metric.detach().mean().item()),
+            "metric_std": float(metric.detach().std(unbiased=False).item()),
+            "curvature_abs": float(curvature.detach().abs().mean().item()),
+            "step": float(step.detach().item()),
+            "mix_residual": float(residual_weight.detach().mean().item()),
+            "mix_metric": float(metric_weight.detach().mean().item()),
+            "mix_curvature": float(curvature_weight.detach().mean().item()),
+            "laplacian_abs": float(laplacian.detach().abs().mean().item()),
+        }
+        return self.out_act(self.out_norm(x + step * update))
+
+
+class GeometricFlowCNNV3(nn.Module):
+    """Adaptive geometric residual CNN.
+
+    This is the current main research model: close to the strong residual
+    baseline in shape, but each block learns whether to move through ordinary
+    residual dynamics, metric-scaled dynamics, or curvature-guided dynamics.
+    """
+
+    def __init__(
+        self,
+        input_channels: int = 1,
+        feature_dim: int = 64,
+        classes: int = 4,
+    ) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.SiLU(inplace=True),
+            AdaptiveGeometricFlowBlock(32),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.SiLU(inplace=True),
+            AdaptiveGeometricFlowBlock(64),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.SiLU(inplace=True),
+            AdaptiveGeometricFlowBlock(128),
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, feature_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.classifier = nn.Linear(feature_dim, classes)
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = self.features(x)
+        return self.classifier(h)
+
+    def geometric_regularization(self, curvature_weight: float, metric_weight: float) -> Tensor:
+        penalties = []
+        for module in self.modules():
+            if isinstance(module, AdaptiveGeometricFlowBlock):
+                if curvature_weight and module.current_curvature is not None:
+                    penalties.append(curvature_weight * module.current_curvature.square().mean())
+                if metric_weight and module.current_metric is not None:
+                    metric_centered = module.current_metric - 1.0
+                    penalties.append(metric_weight * metric_centered.square().mean())
+        if not penalties:
+            return self.classifier.weight.new_zeros(())
+        return torch.stack(penalties).sum()
+
+    def geometric_diagnostics(self) -> Dict[str, float]:
+        stats: Dict[str, List[float]] = {
+            "metric_mean": [],
+            "metric_std": [],
+            "curvature_abs": [],
+            "step": [],
+            "mix_residual": [],
+            "mix_metric": [],
+            "mix_curvature": [],
+            "laplacian_abs": [],
+        }
+        for module in self.modules():
+            if isinstance(module, AdaptiveGeometricFlowBlock) and module.last_stats:
+                for key in stats:
+                    stats[key].append(module.last_stats[key])
+        return {
+            f"geo_{key}": sum(values) / len(values)
+            for key, values in stats.items()
+            if values
+        }
+
+
 @dataclass
 class EpochStats:
     loss: float
@@ -571,6 +735,42 @@ def count_parameters(model: nn.Module) -> int:
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
 
 
+class ModelEMA:
+    """Exponential moving average of model state for evaluation."""
+
+    def __init__(self, model: nn.Module, decay: float) -> None:
+        self.decay = decay
+        self.shadow = {
+            name: value.detach().clone()
+            for name, value in model.state_dict().items()
+            if torch.is_floating_point(value)
+        }
+        self.backup: Dict[str, Tensor] = {}
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        state = model.state_dict()
+        for name, value in state.items():
+            if name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(value.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_to(self, model: nn.Module) -> None:
+        self.backup = {}
+        state = model.state_dict()
+        for name, value in state.items():
+            if name in self.shadow:
+                self.backup[name] = value.detach().clone()
+                value.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        state = model.state_dict()
+        for name, value in self.backup.items():
+            state[name].copy_(value)
+        self.backup = {}
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -579,6 +779,8 @@ def run_epoch(
     label_smoothing: float = 0.0,
     curvature_reg: float = 0.0,
     metric_reg: float = 0.0,
+    grad_clip: float = 0.0,
+    ema: Optional[ModelEMA] = None,
 ) -> EpochStats:
     training = optimizer is not None
     model.train(training)
@@ -604,7 +806,11 @@ def run_epoch(
         if training:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            if ema is not None:
+                ema.update(model)
 
         batch_size = y.size(0)
         total_loss += float(ce_loss.item()) * batch_size
@@ -638,6 +844,8 @@ def train_model(
     label_smoothing: float,
     curvature_reg: float,
     metric_reg: float,
+    grad_clip: float,
+    ema_decay: float,
     device: torch.device,
 ) -> List[Dict[str, float]]:
     model.to(device)
@@ -648,6 +856,7 @@ def train_model(
         if scheduler_name == "cosine"
         else None
     )
+    ema = ModelEMA(model, ema_decay) if ema_decay > 0.0 else None
     history: List[Dict[str, float]] = []
 
     print(f"\n== {name} ==")
@@ -661,8 +870,14 @@ def train_model(
             label_smoothing=label_smoothing,
             curvature_reg=curvature_reg,
             metric_reg=metric_reg,
+            grad_clip=grad_clip,
+            ema=ema,
         )
+        if ema is not None:
+            ema.apply_to(model)
         test = run_epoch(model, test_loader, None, device)
+        if ema is not None:
+            ema.restore(model)
         current_lr = optimizer.param_groups[0]["lr"]
         row = {
             "epoch": float(epoch),
@@ -695,6 +910,13 @@ def train_model(
                 line += f" transport {train.diagnostics['geo_transport']:.3f}"
             if "geo_laplacian_abs" in train.diagnostics:
                 line += f" lap {train.diagnostics['geo_laplacian_abs']:.3f}"
+            if "geo_mix_residual" in train.diagnostics:
+                line += (
+                    f" mix r/m/k "
+                    f"{train.diagnostics['geo_mix_residual']:.2f}/"
+                    f"{train.diagnostics.get('geo_mix_metric', 0.0):.2f}/"
+                    f"{train.diagnostics.get('geo_mix_curvature', 0.0):.2f}"
+                )
         print(line)
         if scheduler is not None:
             scheduler.step()
@@ -911,7 +1133,7 @@ def parse_args() -> argparse.Namespace:
         default="traditional,residual,curved-head,geometric-flow",
         help=(
             "Comma-separated subset: traditional, residual, curved-head, "
-            "geometric-flow, geometric-flow-v2"
+            "geometric-flow, geometric-flow-v2, geometric-flow-v3"
         ),
     )
     parser.add_argument("--lr", type=float, default=3e-3)
@@ -920,6 +1142,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--curvature-reg", type=float, default=1e-4)
     parser.add_argument("--metric-reg", type=float, default=1e-5)
+    parser.add_argument("--grad-clip", type=float, default=0.0)
+    parser.add_argument("--ema-decay", type=float, default=0.0)
     parser.add_argument("--noise", type=float, default=0.22)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--seeds", type=str, default=None)
@@ -961,6 +1185,7 @@ def selected_model_builders(model_names: str) -> Dict[str, Type[nn.Module]]:
         "curved-head": ("Curved Metric CNN", CurvedMetricCNN),
         "geometric-flow": ("Geometric Flow CNN", GeometricFlowCNN),
         "geometric-flow-v2": ("Geometric Flow CNN V2", GeometricFlowCNNV2),
+        "geometric-flow-v3": ("Geometric Flow CNN V3", GeometricFlowCNNV3),
     }
     selected = [name.strip() for name in model_names.split(",") if name.strip()]
     unknown = [name for name in selected if name not in registry]
@@ -1019,6 +1244,8 @@ def main() -> None:
                 label_smoothing=args.label_smoothing,
                 curvature_reg=args.curvature_reg,
                 metric_reg=args.metric_reg,
+                grad_clip=args.grad_clip,
+                ema_decay=args.ema_decay,
                 device=device,
             )
 

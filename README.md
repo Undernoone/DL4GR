@@ -18,8 +18,11 @@ The demo is intentionally lightweight:
 - `GeometricFlowCNNV2`: a stronger version with channel/spatial metric factors,
   Laplacian curvature flow, low-rank channel transport, and deeper geometric
   stages.
+- `GeometricFlowCNNV3`: an adaptive geometric residual CNN that learns how much
+  ordinary residual motion, metric-scaled motion, and curvature-guided motion to
+  use at each stage.
 
-Both geometric-flow models follow:
+All geometric-flow models follow:
 
 ```text
 X_{l+1} = G_theta(X_l, g_theta(X_l), kappa_theta(X_l))
@@ -103,12 +106,13 @@ python3 experiments/curved_cnn_demo.py \
   --epochs 50 \
   --batch-size 512 \
   --feature-dim 128 \
-  --models residual,geometric-flow,geometric-flow-v2 \
+  --models residual,geometric-flow,geometric-flow-v3 \
   --curvature-reg 0.00005 \
   --metric-reg 0.000005 \
-  --random-erasing 0.25 \
   --scheduler cosine \
   --label-smoothing 0.05 \
+  --grad-clip 1.0 \
+  --ema-decay 0.999 \
   --seed 7 \
   --metrics-json outputs/cifar10_v3_strong_seed7.json \
   --plot outputs/cifar10_v3_strong_seed7.png
@@ -123,10 +127,11 @@ python3 experiments/curved_cnn_demo.py \
   --epochs 50 \
   --batch-size 512 \
   --feature-dim 128 \
-  --models residual,geometric-flow-v2 \
+  --models residual,geometric-flow,geometric-flow-v3 \
   --curvature-reg 0.00005 \
   --metric-reg 0.000005 \
-  --random-erasing 0.25 \
+  --grad-clip 1.0 \
+  --ema-decay 0.999 \
   --seeds 7,11,17 \
   --metrics-json outputs/cifar10_v3_multiseed.json
 ```
@@ -144,6 +149,7 @@ Geometric-flow runs print extra diagnostics:
 - `step`: learned residual flow step size.
 - `transport`: low-rank channel transport strength, for V2.
 - `lap`: average absolute Laplacian response, for V2.
+- `mix r/m/k`: residual, metric, and curvature mixture weights, for V3.
 
 All randomness is fixed by default: Python, Torch, CUDA/cuDNN deterministic
 settings, synthetic sample generation, dataset split, and DataLoader shuffling
