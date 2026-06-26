@@ -18,7 +18,7 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
@@ -127,6 +127,61 @@ class ConvEncoder(nn.Module):
         return self.net(x)
 
 
+class ResidualConvBlock(nn.Module):
+    """Plain residual block used as a fairer non-geometric baseline."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.out_act = nn.SiLU(inplace=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.out_act(x + self.net(x))
+
+
+class ResidualCNN(nn.Module):
+    """CNN with standard residual blocks but no metric or curvature fields."""
+
+    def __init__(
+        self,
+        input_channels: int = 1,
+        feature_dim: int = 64,
+        classes: int = 4,
+    ) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.SiLU(inplace=True),
+            ResidualConvBlock(32),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.SiLU(inplace=True),
+            ResidualConvBlock(64),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.SiLU(inplace=True),
+            ResidualConvBlock(128),
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, feature_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.classifier = nn.Linear(feature_dim, classes)
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = self.features(x)
+        return self.classifier(h)
+
+
 class TraditionalCNN(nn.Module):
     """Plain CNN encoder plus a linear classifier."""
 
@@ -222,6 +277,9 @@ class GeometricFlowBlock(nn.Module):
         self.step_logit = nn.Parameter(torch.tensor(-2.0))
         self.out_norm = nn.BatchNorm2d(channels)
         self.out_act = nn.SiLU(inplace=True)
+        self.current_metric: Optional[Tensor] = None
+        self.current_curvature: Optional[Tensor] = None
+        self.last_stats: Dict[str, float] = {}
 
     def forward(self, x: Tensor) -> Tensor:
         vector = self.vector_field(x)
@@ -230,10 +288,18 @@ class GeometricFlowBlock(nn.Module):
         metric = metric / metric.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-4)
 
         curvature = self.curvature(x)
+        self.current_metric = metric
+        self.current_curvature = curvature
         first_order = metric * vector
         second_order = 0.5 * curvature * first_order * torch.tanh(first_order)
         step = torch.sigmoid(self.step_logit)
 
+        self.last_stats = {
+            "metric_mean": float(metric.detach().mean().item()),
+            "metric_std": float(metric.detach().std(unbiased=False).item()),
+            "curvature_abs": float(curvature.detach().abs().mean().item()),
+            "step": float(step.detach().item()),
+        }
         return self.out_act(self.out_norm(x + step * (first_order + second_order)))
 
 
@@ -273,11 +339,43 @@ class GeometricFlowCNN(nn.Module):
         h = self.features(x)
         return self.classifier(h)
 
+    def geometric_regularization(self, curvature_weight: float, metric_weight: float) -> Tensor:
+        penalties = []
+        for module in self.modules():
+            if isinstance(module, GeometricFlowBlock):
+                if curvature_weight and module.current_curvature is not None:
+                    penalties.append(curvature_weight * module.current_curvature.square().mean())
+                if metric_weight and module.current_metric is not None:
+                    metric_centered = module.current_metric - 1.0
+                    penalties.append(metric_weight * metric_centered.square().mean())
+        if not penalties:
+            return self.classifier.weight.new_zeros(())
+        return torch.stack(penalties).sum()
+
+    def geometric_diagnostics(self) -> Dict[str, float]:
+        stats: Dict[str, List[float]] = {
+            "metric_mean": [],
+            "metric_std": [],
+            "curvature_abs": [],
+            "step": [],
+        }
+        for module in self.modules():
+            if isinstance(module, GeometricFlowBlock) and module.last_stats:
+                for key in stats:
+                    stats[key].append(module.last_stats[key])
+        return {
+            f"geo_{key}": sum(values) / len(values)
+            for key, values in stats.items()
+            if values
+        }
+
 
 @dataclass
 class EpochStats:
     loss: float
     accuracy: float
+    reg_loss: float = 0.0
+    diagnostics: Optional[Dict[str, float]] = None
 
 
 def set_seed(seed: int, deterministic: bool = True) -> None:
@@ -298,18 +396,27 @@ def seed_worker(worker_id: int) -> None:
     torch.manual_seed(worker_seed)
 
 
+def count_parameters(model: nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
-    optimizer: torch.optim.Optimizer | None,
+    optimizer: Optional[torch.optim.Optimizer],
     device: torch.device,
+    label_smoothing: float = 0.0,
+    curvature_reg: float = 0.0,
+    metric_reg: float = 0.0,
 ) -> EpochStats:
     training = optimizer is not None
     model.train(training)
 
     total_loss = 0.0
+    total_reg_loss = 0.0
     total_correct = 0
     total_samples = 0
+    diagnostic_sums: Dict[str, float] = {}
 
     for x, y in loader:
         x = x.to(device)
@@ -317,7 +424,11 @@ def run_epoch(
 
         with torch.set_grad_enabled(training):
             logits = model(x)
-            loss = F.cross_entropy(logits, y)
+            ce_loss = F.cross_entropy(logits, y, label_smoothing=label_smoothing)
+            reg_loss = ce_loss.new_zeros(())
+            if training and hasattr(model, "geometric_regularization"):
+                reg_loss = model.geometric_regularization(curvature_reg, metric_reg)
+            loss = ce_loss + reg_loss
 
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -325,13 +436,22 @@ def run_epoch(
             optimizer.step()
 
         batch_size = y.size(0)
-        total_loss += float(loss.item()) * batch_size
+        total_loss += float(ce_loss.item()) * batch_size
+        total_reg_loss += float(reg_loss.item()) * batch_size
         total_correct += int((logits.argmax(dim=-1) == y).sum().item())
         total_samples += batch_size
+        if hasattr(model, "geometric_diagnostics"):
+            for key, value in model.geometric_diagnostics().items():
+                diagnostic_sums[key] = diagnostic_sums.get(key, 0.0) + value * batch_size
 
     return EpochStats(
         loss=total_loss / total_samples,
         accuracy=total_correct / total_samples,
+        reg_loss=total_reg_loss / total_samples,
+        diagnostics={
+            key: value / total_samples
+            for key, value in diagnostic_sums.items()
+        } or None,
     )
 
 
@@ -342,34 +462,72 @@ def train_model(
     test_loader: DataLoader,
     epochs: int,
     lr: float,
+    weight_decay: float,
+    scheduler_name: str,
+    label_smoothing: float,
+    curvature_reg: float,
+    metric_reg: float,
     device: torch.device,
 ) -> List[Dict[str, float]]:
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    params = count_parameters(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        if scheduler_name == "cosine"
+        else None
+    )
     history: List[Dict[str, float]] = []
 
     print(f"\n== {name} ==")
+    print(f"parameters: {params:,}")
     for epoch in range(1, epochs + 1):
-        train = run_epoch(model, train_loader, optimizer, device)
+        train = run_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            label_smoothing=label_smoothing,
+            curvature_reg=curvature_reg,
+            metric_reg=metric_reg,
+        )
         test = run_epoch(model, test_loader, None, device)
+        current_lr = optimizer.param_groups[0]["lr"]
         row = {
             "epoch": float(epoch),
+            "lr": float(current_lr),
             "train_loss": train.loss,
             "train_acc": train.accuracy,
+            "train_reg_loss": train.reg_loss,
             "test_loss": test.loss,
             "test_acc": test.accuracy,
+            "parameters": float(params),
         }
+        if train.diagnostics:
+            row.update(train.diagnostics)
         history.append(row)
-        print(
+        line = (
             f"epoch {epoch:02d} | "
             f"train loss {train.loss:.4f} acc {train.accuracy:.3f} | "
             f"test loss {test.loss:.4f} acc {test.accuracy:.3f}"
         )
+        if train.reg_loss:
+            line += f" | reg {train.reg_loss:.5f}"
+        if train.diagnostics:
+            line += (
+                f" | g {train.diagnostics.get('geo_metric_mean', 0.0):.3f}"
+                f"+/-{train.diagnostics.get('geo_metric_std', 0.0):.3f}"
+                f" |k| {train.diagnostics.get('geo_curvature_abs', 0.0):.3f}"
+                f" step {train.diagnostics.get('geo_step', 0.0):.3f}"
+            )
+        print(line)
+        if scheduler is not None:
+            scheduler.step()
 
     return history
 
 
-def maybe_plot(results: Dict[str, List[Dict[str, float]]], output_path: str | None) -> None:
+def maybe_plot(results: Dict[str, List[Dict[str, float]]], output_path: Optional[str]) -> None:
     if output_path is None:
         return
 
@@ -394,7 +552,7 @@ def maybe_plot(results: Dict[str, List[Dict[str, float]]], output_path: str | No
     print(f"\nSaved plot to {path}")
 
 
-def maybe_save_metrics(results: Dict[str, List[Dict[str, float]]], output_path: str | None) -> None:
+def maybe_save_metrics(results: Dict[str, List[Dict[str, float]]], output_path: Optional[str]) -> None:
     if output_path is None:
         return
 
@@ -404,7 +562,7 @@ def maybe_save_metrics(results: Dict[str, List[Dict[str, float]]], output_path: 
     print(f"Saved metrics to {path}")
 
 
-def deterministic_subset(dataset: Dataset, limit: int | None, seed: int) -> Dataset:
+def deterministic_subset(dataset: Dataset, limit: Optional[int], seed: int) -> Dataset:
     if limit is None or limit >= len(dataset):
         return dataset
     generator = torch.Generator().manual_seed(seed)
@@ -432,17 +590,42 @@ def build_public_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset, D
     data_root = Path(args.data_dir)
 
     if dataset_name == "mnist":
-        transform = transforms.Compose(
+        train_transform = transforms.Compose(
+            [
+                transforms.RandomCrop(28, padding=2),
+                transforms.ToTensor(),
+                transforms.Normalize((0.1307,), (0.3081,)),
+            ]
+        ) if args.augment else transforms.Compose(
             [
                 transforms.ToTensor(),
                 transforms.Normalize((0.1307,), (0.3081,)),
             ]
         )
-        train_set = datasets.MNIST(data_root, train=True, download=args.download, transform=transform)
-        test_set = datasets.MNIST(data_root, train=False, download=args.download, transform=transform)
+        test_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.1307,), (0.3081,)),
+            ]
+        )
+        train_set = datasets.MNIST(data_root, train=True, download=args.download, transform=train_transform)
+        test_set = datasets.MNIST(data_root, train=False, download=args.download, transform=test_transform)
         config = DataConfig(classes=10, input_channels=1)
     elif dataset_name == "fashion-mnist":
-        transform = transforms.Compose(
+        train_transform = transforms.Compose(
+            [
+                transforms.RandomCrop(28, padding=2),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.2860,), (0.3530,)),
+            ]
+        ) if args.augment else transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.2860,), (0.3530,)),
+            ]
+        )
+        test_transform = transforms.Compose(
             [
                 transforms.ToTensor(),
                 transforms.Normalize((0.2860,), (0.3530,)),
@@ -452,24 +635,37 @@ def build_public_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset, D
             data_root,
             train=True,
             download=args.download,
-            transform=transform,
+            transform=train_transform,
         )
         test_set = datasets.FashionMNIST(
             data_root,
             train=False,
             download=args.download,
-            transform=transform,
+            transform=test_transform,
         )
         config = DataConfig(classes=10, input_channels=1)
     elif dataset_name == "cifar10":
-        transform = transforms.Compose(
+        train_transform = transforms.Compose(
+            [
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+            ]
+        ) if args.augment else transforms.Compose(
             [
                 transforms.ToTensor(),
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
             ]
         )
-        train_set = datasets.CIFAR10(data_root, train=True, download=args.download, transform=transform)
-        test_set = datasets.CIFAR10(data_root, train=False, download=args.download, transform=transform)
+        test_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+            ]
+        )
+        train_set = datasets.CIFAR10(data_root, train=True, download=args.download, transform=train_transform)
+        test_set = datasets.CIFAR10(data_root, train=False, download=args.download, transform=test_transform)
         config = DataConfig(classes=10, input_channels=3)
     else:
         raise ValueError(f"Unsupported dataset: {args.dataset}")
@@ -516,6 +712,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--samples", type=int, default=4000)
     parser.add_argument("--train-samples", type=int, default=None)
@@ -525,10 +722,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models",
         type=str,
-        default="traditional,curved-head,geometric-flow",
-        help="Comma-separated subset: traditional, curved-head, geometric-flow",
+        default="traditional,residual,curved-head,geometric-flow",
+        help="Comma-separated subset: traditional, residual, curved-head, geometric-flow",
     )
     parser.add_argument("--lr", type=float, default=3e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--scheduler", type=str, default="cosine", choices=["none", "cosine"])
+    parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--curvature-reg", type=float, default=1e-4)
+    parser.add_argument("--metric-reg", type=float, default=1e-5)
     parser.add_argument("--noise", type=float, default=0.22)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -556,6 +758,7 @@ def choose_device(device: str) -> torch.device:
 def selected_model_builders(model_names: str) -> Dict[str, Type[nn.Module]]:
     registry: Dict[str, Tuple[str, Type[nn.Module]]] = {
         "traditional": ("Traditional CNN", TraditionalCNN),
+        "residual": ("Residual CNN", ResidualCNN),
         "curved-head": ("Curved Metric CNN", CurvedMetricCNN),
         "geometric-flow": ("Geometric Flow CNN", GeometricFlowCNN),
     }
@@ -587,6 +790,11 @@ def main() -> None:
             test_loader=test_loader,
             epochs=args.epochs,
             lr=args.lr,
+            weight_decay=args.weight_decay,
+            scheduler_name=args.scheduler,
+            label_smoothing=args.label_smoothing,
+            curvature_reg=args.curvature_reg,
+            metric_reg=args.metric_reg,
             device=device,
         )
 

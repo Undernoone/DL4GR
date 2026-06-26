@@ -9,6 +9,8 @@ The demo is intentionally lightweight:
 
 - `TraditionalCNN`: a simple convolutional encoder followed by a linear
   classifier.
+- `ResidualCNN`: a non-geometric residual CNN baseline with a structure closer
+  to the geometric-flow model.
 - `CurvedMetricCNN`: the same encoder followed by a prototype classifier whose
   distances are measured with a sample-dependent metric `G(h)`.
 - `GeometricFlowCNN`: a CNN whose internal feature maps are updated by learned
@@ -61,7 +63,10 @@ python3 experiments/curved_cnn_demo.py \
   --dataset cifar10 \
   --device cuda \
   --epochs 30 \
-  --models traditional,geometric-flow \
+  --batch-size 512 \
+  --models traditional,residual,geometric-flow \
+  --scheduler cosine \
+  --label-smoothing 0.05 \
   --seed 7 \
   --metrics-json outputs/cifar10_metrics.json \
   --plot outputs/cifar10_curved_cnn.png
@@ -74,10 +79,27 @@ python3 experiments/curved_cnn_demo.py \
   --dataset cifar10 \
   --device cuda \
   --epochs 30 \
+  --batch-size 512 \
   --models geometric-flow \
+  --curvature-reg 0.0001 \
+  --metric-reg 0.00001 \
+  --scheduler cosine \
+  --label-smoothing 0.05 \
   --seed 7 \
   --metrics-json outputs/cifar10_geometric_flow.json
 ```
+
+By default, public training datasets use light augmentation. For CIFAR10 this
+means random crop plus horizontal flip. Use `--no-augment` for an ablation.
+Runs also use cosine learning-rate decay and label smoothing by default; use
+`--scheduler none` or `--label-smoothing 0.0` for ablations.
+
+Geometric-flow runs print extra diagnostics:
+
+- `reg`: the added geometric regularization term.
+- `g`: mean and standard deviation of the learned metric field.
+- `|k|`: mean absolute curvature.
+- `step`: learned residual flow step size.
 
 All randomness is fixed by default: Python, Torch, CUDA/cuDNN deterministic
 settings, synthetic sample generation, dataset split, and DataLoader shuffling
