@@ -11,6 +11,12 @@ The demo is intentionally lightweight:
   classifier.
 - `CurvedMetricCNN`: the same encoder followed by a prototype classifier whose
   distances are measured with a sample-dependent metric `G(h)`.
+- `GeometricFlowCNN`: a CNN whose internal feature maps are updated by learned
+  metric and curvature fields:
+
+```text
+X_{l+1} = G_theta(X_l, g_theta(X_l), kappa_theta(X_l))
+```
 
 In the curved model, the classifier logit for class `c` is:
 
@@ -55,9 +61,22 @@ python3 experiments/curved_cnn_demo.py \
   --dataset cifar10 \
   --device cuda \
   --epochs 30 \
+  --models traditional,geometric-flow \
   --seed 7 \
   --metrics-json outputs/cifar10_metrics.json \
   --plot outputs/cifar10_curved_cnn.png
+```
+
+Run only the geometric-flow model:
+
+```bash
+python3 experiments/curved_cnn_demo.py \
+  --dataset cifar10 \
+  --device cuda \
+  --epochs 30 \
+  --models geometric-flow \
+  --seed 7 \
+  --metrics-json outputs/cifar10_geometric_flow.json
 ```
 
 All randomness is fixed by default: Python, Torch, CUDA/cuDNN deterministic

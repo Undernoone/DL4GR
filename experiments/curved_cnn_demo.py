@@ -4,6 +4,7 @@ The goal of this script is not to claim a benchmark win. It is a compact,
 hackable demo for the idea:
 
     data/task -> local metric G(h) -> distances/logits in curved feature space
+    X_{l+1} = G_theta(X_l, g_theta(X_l), kappa_theta(X_l))
 
 The script supports synthetic data plus public torchvision datasets.
 """
@@ -17,7 +18,7 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Type
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
@@ -188,6 +189,89 @@ class CurvedMetricCNN(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         h = self.encoder(x)
         return self.head(h)
+
+
+class GeometricFlowBlock(nn.Module):
+    """Layer update driven by a learned metric and curvature.
+
+    This block implements a stable residual version of:
+
+        X_{l+1} = G_theta(X_l, g_theta(X_l), kappa_theta(X_l))
+
+    `g_theta` is a positive local metric gate over channels and spatial
+    positions. `kappa_theta` is a bounded channel-wise curvature signal. The
+    update uses a first-order vector field plus a small curvature-dependent
+    second-order correction.
+    """
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.vector_field = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.metric = nn.Conv2d(channels, channels, kernel_size=1)
+        self.curvature = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.Tanh(),
+        )
+        self.step_logit = nn.Parameter(torch.tensor(-2.0))
+        self.out_norm = nn.BatchNorm2d(channels)
+        self.out_act = nn.SiLU(inplace=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        vector = self.vector_field(x)
+
+        metric = F.softplus(self.metric(x)) + 1e-4
+        metric = metric / metric.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-4)
+
+        curvature = self.curvature(x)
+        first_order = metric * vector
+        second_order = 0.5 * curvature * first_order * torch.tanh(first_order)
+        step = torch.sigmoid(self.step_logit)
+
+        return self.out_act(self.out_norm(x + step * (first_order + second_order)))
+
+
+class GeometricFlowCNN(nn.Module):
+    """CNN whose internal feature maps evolve through geometric flow blocks."""
+
+    def __init__(
+        self,
+        input_channels: int = 1,
+        feature_dim: int = 64,
+        classes: int = 4,
+    ) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.SiLU(inplace=True),
+            GeometricFlowBlock(32),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.SiLU(inplace=True),
+            GeometricFlowBlock(64),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.SiLU(inplace=True),
+            GeometricFlowBlock(128),
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, feature_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.classifier = nn.Linear(feature_dim, classes)
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = self.features(x)
+        return self.classifier(h)
 
 
 @dataclass
@@ -438,6 +522,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-samples", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--feature-dim", type=int, default=64)
+    parser.add_argument(
+        "--models",
+        type=str,
+        default="traditional,curved-head,geometric-flow",
+        help="Comma-separated subset: traditional, curved-head, geometric-flow",
+    )
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--noise", type=float, default=0.22)
     parser.add_argument("--seed", type=int, default=7)
@@ -463,16 +553,27 @@ def choose_device(device: str) -> torch.device:
     return torch.device(device)
 
 
+def selected_model_builders(model_names: str) -> Dict[str, Type[nn.Module]]:
+    registry: Dict[str, Tuple[str, Type[nn.Module]]] = {
+        "traditional": ("Traditional CNN", TraditionalCNN),
+        "curved-head": ("Curved Metric CNN", CurvedMetricCNN),
+        "geometric-flow": ("Geometric Flow CNN", GeometricFlowCNN),
+    }
+    selected = [name.strip() for name in model_names.split(",") if name.strip()]
+    unknown = [name for name in selected if name not in registry]
+    if unknown:
+        valid = ", ".join(registry)
+        raise ValueError(f"Unknown model(s): {unknown}. Valid options: {valid}")
+    return {registry[name][0]: registry[name][1] for name in selected}
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     device = choose_device(args.device)
 
     results = {}
-    for name, model_cls in {
-        "Traditional CNN": TraditionalCNN,
-        "Curved Metric CNN": CurvedMetricCNN,
-    }.items():
+    for name, model_cls in selected_model_builders(args.models).items():
         set_seed(args.seed)
         train_loader, test_loader, data_config = build_loaders(args)
         results[name] = train_model(
