@@ -370,6 +370,177 @@ class GeometricFlowCNN(nn.Module):
         }
 
 
+class GeometricFlowBlockV2(nn.Module):
+    """Richer curvature-aware flow block.
+
+    Compared with `GeometricFlowBlock`, this version separates the learned
+    metric into channel and spatial factors, adds a fixed Laplacian probe for
+    local curvature-sensitive smoothing, and includes a low-rank channel
+    transport term as a cheap approximation to a non-diagonal metric.
+    """
+
+    def __init__(self, channels: int, rank: Optional[int] = None) -> None:
+        super().__init__()
+        rank = rank or max(16, channels // 4)
+        hidden = max(16, channels // 4)
+
+        self.vector_field = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.channel_metric = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden, kernel_size=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+        )
+        self.spatial_metric = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        self.local_curvature = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels),
+            nn.Conv2d(channels, channels, kernel_size=1),
+        )
+        self.global_curvature = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden, kernel_size=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+        )
+        self.transport_down = nn.Conv2d(channels, rank, kernel_size=1, bias=False)
+        self.transport_up = nn.Conv2d(rank, channels, kernel_size=1, bias=False)
+        self.step_logit = nn.Parameter(torch.tensor(-2.2))
+        self.transport_logit = nn.Parameter(torch.tensor(-3.0))
+        self.out_norm = nn.BatchNorm2d(channels)
+        self.out_act = nn.SiLU(inplace=True)
+        self.register_buffer(
+            "laplacian_kernel",
+            torch.tensor(
+                [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+                dtype=torch.float32,
+            ).view(1, 1, 3, 3),
+        )
+
+        self.current_metric: Optional[Tensor] = None
+        self.current_curvature: Optional[Tensor] = None
+        self.last_stats: Dict[str, float] = {}
+
+    def forward(self, x: Tensor) -> Tensor:
+        vector = self.vector_field(x)
+
+        channel_metric = F.softplus(self.channel_metric(x)) + 1e-4
+        spatial_metric = F.softplus(self.spatial_metric(x)) + 1e-4
+        metric = channel_metric * spatial_metric
+        metric = metric / metric.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1e-4)
+
+        curvature = torch.tanh(self.local_curvature(x) + self.global_curvature(x))
+        kernel = self.laplacian_kernel.to(dtype=x.dtype).repeat(x.size(1), 1, 1, 1)
+        laplacian = F.conv2d(x, kernel, padding=1, groups=x.size(1))
+        transport = self.transport_up(self.transport_down(vector))
+
+        step = torch.sigmoid(self.step_logit)
+        transport_scale = torch.sigmoid(self.transport_logit)
+        first_order = metric * vector
+        curvature_flow = 0.25 * curvature * torch.tanh(laplacian)
+        transport_flow = transport_scale * transport
+
+        self.current_metric = metric
+        self.current_curvature = curvature
+        self.last_stats = {
+            "metric_mean": float(metric.detach().mean().item()),
+            "metric_std": float(metric.detach().std(unbiased=False).item()),
+            "curvature_abs": float(curvature.detach().abs().mean().item()),
+            "step": float(step.detach().item()),
+            "transport": float(transport_scale.detach().item()),
+            "laplacian_abs": float(laplacian.detach().abs().mean().item()),
+        }
+
+        update = first_order + curvature_flow + transport_flow
+        return self.out_act(self.out_norm(x + step * update))
+
+
+class GeometricFlowCNNV2(nn.Module):
+    """Stronger geometric-flow CNN with multi-block geometric stages."""
+
+    def __init__(
+        self,
+        input_channels: int = 1,
+        feature_dim: int = 64,
+        classes: int = 4,
+    ) -> None:
+        super().__init__()
+        c1, c2, c3 = 48, 96, 192
+        self.features = nn.Sequential(
+            nn.Conv2d(input_channels, c1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.SiLU(inplace=True),
+            GeometricFlowBlockV2(c1),
+            GeometricFlowBlockV2(c1),
+            nn.MaxPool2d(2),
+            nn.Conv2d(c1, c2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.SiLU(inplace=True),
+            GeometricFlowBlockV2(c2),
+            GeometricFlowBlockV2(c2),
+            nn.MaxPool2d(2),
+            nn.Conv2d(c2, c3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(c3),
+            nn.SiLU(inplace=True),
+            GeometricFlowBlockV2(c3),
+            GeometricFlowBlockV2(c3),
+            GeometricFlowBlockV2(c3),
+            nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Flatten(),
+            nn.Linear(c3 * 4 * 4, feature_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.classifier = nn.Linear(feature_dim, classes)
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = self.features(x)
+        return self.classifier(h)
+
+    def geometric_regularization(self, curvature_weight: float, metric_weight: float) -> Tensor:
+        penalties = []
+        for module in self.modules():
+            if isinstance(module, GeometricFlowBlockV2):
+                if curvature_weight and module.current_curvature is not None:
+                    penalties.append(curvature_weight * module.current_curvature.square().mean())
+                if metric_weight and module.current_metric is not None:
+                    metric_centered = module.current_metric - 1.0
+                    penalties.append(metric_weight * metric_centered.square().mean())
+        if not penalties:
+            return self.classifier.weight.new_zeros(())
+        return torch.stack(penalties).sum()
+
+    def geometric_diagnostics(self) -> Dict[str, float]:
+        stats: Dict[str, List[float]] = {
+            "metric_mean": [],
+            "metric_std": [],
+            "curvature_abs": [],
+            "step": [],
+            "transport": [],
+            "laplacian_abs": [],
+        }
+        for module in self.modules():
+            if isinstance(module, GeometricFlowBlockV2) and module.last_stats:
+                for key in stats:
+                    stats[key].append(module.last_stats[key])
+        return {
+            f"geo_{key}": sum(values) / len(values)
+            for key, values in stats.items()
+            if values
+        }
+
+
 @dataclass
 class EpochStats:
     loss: float
@@ -520,6 +691,10 @@ def train_model(
                 f" |k| {train.diagnostics.get('geo_curvature_abs', 0.0):.3f}"
                 f" step {train.diagnostics.get('geo_step', 0.0):.3f}"
             )
+            if "geo_transport" in train.diagnostics:
+                line += f" transport {train.diagnostics['geo_transport']:.3f}"
+            if "geo_laplacian_abs" in train.diagnostics:
+                line += f" lap {train.diagnostics['geo_laplacian_abs']:.3f}"
         print(line)
         if scheduler is not None:
             scheduler.step()
@@ -645,19 +820,29 @@ def build_public_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset, D
         )
         config = DataConfig(classes=10, input_channels=1)
     elif dataset_name == "cifar10":
-        train_transform = transforms.Compose(
-            [
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
-            ]
-        ) if args.augment else transforms.Compose(
+        train_steps = []
+        if args.augment:
+            train_steps.extend(
+                [
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                ]
+            )
+        train_steps.extend(
             [
                 transforms.ToTensor(),
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
             ]
         )
+        if args.augment and args.random_erasing > 0.0:
+            train_steps.append(
+                transforms.RandomErasing(
+                    p=args.random_erasing,
+                    scale=(0.02, 0.15),
+                    ratio=(0.3, 3.3),
+                )
+            )
+        train_transform = transforms.Compose(train_steps)
         test_transform = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -713,6 +898,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--random-erasing", type=float, default=0.0)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--samples", type=int, default=4000)
     parser.add_argument("--train-samples", type=int, default=None)
@@ -723,7 +909,10 @@ def parse_args() -> argparse.Namespace:
         "--models",
         type=str,
         default="traditional,residual,curved-head,geometric-flow",
-        help="Comma-separated subset: traditional, residual, curved-head, geometric-flow",
+        help=(
+            "Comma-separated subset: traditional, residual, curved-head, "
+            "geometric-flow, geometric-flow-v2"
+        ),
     )
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -733,6 +922,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metric-reg", type=float, default=1e-5)
     parser.add_argument("--noise", type=float, default=0.22)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--seeds", type=str, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--plot", type=str, default=None)
     parser.add_argument("--metrics-json", type=str, default=None)
@@ -755,12 +945,22 @@ def choose_device(device: str) -> torch.device:
     return torch.device(device)
 
 
+def parse_seed_values(seed: int, seeds: Optional[str]) -> List[int]:
+    if seeds is None:
+        return [seed]
+    values = [value.strip() for value in seeds.split(",") if value.strip()]
+    if not values:
+        return [seed]
+    return [int(value) for value in values]
+
+
 def selected_model_builders(model_names: str) -> Dict[str, Type[nn.Module]]:
     registry: Dict[str, Tuple[str, Type[nn.Module]]] = {
         "traditional": ("Traditional CNN", TraditionalCNN),
         "residual": ("Residual CNN", ResidualCNN),
         "curved-head": ("Curved Metric CNN", CurvedMetricCNN),
         "geometric-flow": ("Geometric Flow CNN", GeometricFlowCNN),
+        "geometric-flow-v2": ("Geometric Flow CNN V2", GeometricFlowCNNV2),
     }
     selected = [name.strip() for name in model_names.split(",") if name.strip()]
     unknown = [name for name in selected if name not in registry]
@@ -770,34 +970,59 @@ def selected_model_builders(model_names: str) -> Dict[str, Type[nn.Module]]:
     return {registry[name][0]: registry[name][1] for name in selected}
 
 
+def print_summary(results: Dict[str, List[Dict[str, float]]]) -> None:
+    print("\n== Summary ==")
+    grouped: Dict[str, List[float]] = {}
+    for name, history in results.items():
+        best = max(history, key=lambda row: row["test_acc"])
+        final = history[-1]
+        base_name = name.split(" seed=")[0]
+        grouped.setdefault(base_name, []).append(best["test_acc"])
+        print(
+            f"{name}: best test acc {best['test_acc']:.3f} "
+            f"(epoch {int(best['epoch'])}), final {final['test_acc']:.3f}"
+        )
+    multi_seed = {name: values for name, values in grouped.items() if len(values) > 1}
+    if multi_seed:
+        print("\n== Multi-Seed Best Accuracy ==")
+        for name, values in multi_seed.items():
+            mean = sum(values) / len(values)
+            variance = sum((value - mean) ** 2 for value in values) / len(values)
+            print(f"{name}: mean {mean:.3f}, std {math.sqrt(variance):.3f}, n={len(values)}")
+
+
 def main() -> None:
     args = parse_args()
-    set_seed(args.seed)
     device = choose_device(args.device)
 
     results = {}
-    for name, model_cls in selected_model_builders(args.models).items():
-        set_seed(args.seed)
-        train_loader, test_loader, data_config = build_loaders(args)
-        results[name] = train_model(
-            name=name,
-            model=model_cls(
-                input_channels=data_config.input_channels,
-                feature_dim=args.feature_dim,
-                classes=data_config.classes,
-            ),
-            train_loader=train_loader,
-            test_loader=test_loader,
-            epochs=args.epochs,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            scheduler_name=args.scheduler,
-            label_smoothing=args.label_smoothing,
-            curvature_reg=args.curvature_reg,
-            metric_reg=args.metric_reg,
-            device=device,
-        )
+    seed_values = parse_seed_values(args.seed, args.seeds)
+    for seed in seed_values:
+        args.seed = seed
+        for name, model_cls in selected_model_builders(args.models).items():
+            set_seed(seed)
+            train_loader, test_loader, data_config = build_loaders(args)
+            result_name = f"{name} seed={seed}" if len(seed_values) > 1 else name
+            results[result_name] = train_model(
+                name=result_name,
+                model=model_cls(
+                    input_channels=data_config.input_channels,
+                    feature_dim=args.feature_dim,
+                    classes=data_config.classes,
+                ),
+                train_loader=train_loader,
+                test_loader=test_loader,
+                epochs=args.epochs,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                scheduler_name=args.scheduler,
+                label_smoothing=args.label_smoothing,
+                curvature_reg=args.curvature_reg,
+                metric_reg=args.metric_reg,
+                device=device,
+            )
 
+    print_summary(results)
     maybe_save_metrics(results, args.metrics_json)
     maybe_plot(results, args.plot)
 

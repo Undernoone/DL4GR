@@ -14,7 +14,12 @@ The demo is intentionally lightweight:
 - `CurvedMetricCNN`: the same encoder followed by a prototype classifier whose
   distances are measured with a sample-dependent metric `G(h)`.
 - `GeometricFlowCNN`: a CNN whose internal feature maps are updated by learned
-  metric and curvature fields:
+  metric and curvature fields.
+- `GeometricFlowCNNV2`: a stronger version with channel/spatial metric factors,
+  Laplacian curvature flow, low-rank channel transport, and deeper geometric
+  stages.
+
+Both geometric-flow models follow:
 
 ```text
 X_{l+1} = G_theta(X_l, g_theta(X_l), kappa_theta(X_l))
@@ -89,6 +94,43 @@ python3 experiments/curved_cnn_demo.py \
   --metrics-json outputs/cifar10_geometric_flow.json
 ```
 
+Run the strongest current model:
+
+```bash
+python3 experiments/curved_cnn_demo.py \
+  --dataset cifar10 \
+  --device cuda \
+  --epochs 50 \
+  --batch-size 512 \
+  --feature-dim 128 \
+  --models residual,geometric-flow,geometric-flow-v2 \
+  --curvature-reg 0.00005 \
+  --metric-reg 0.000005 \
+  --random-erasing 0.25 \
+  --scheduler cosine \
+  --label-smoothing 0.05 \
+  --seed 7 \
+  --metrics-json outputs/cifar10_v3_strong_seed7.json \
+  --plot outputs/cifar10_v3_strong_seed7.png
+```
+
+Run several seeds for a stronger claim:
+
+```bash
+python3 experiments/curved_cnn_demo.py \
+  --dataset cifar10 \
+  --device cuda \
+  --epochs 50 \
+  --batch-size 512 \
+  --feature-dim 128 \
+  --models residual,geometric-flow-v2 \
+  --curvature-reg 0.00005 \
+  --metric-reg 0.000005 \
+  --random-erasing 0.25 \
+  --seeds 7,11,17 \
+  --metrics-json outputs/cifar10_v3_multiseed.json
+```
+
 By default, public training datasets use light augmentation. For CIFAR10 this
 means random crop plus horizontal flip. Use `--no-augment` for an ablation.
 Runs also use cosine learning-rate decay and label smoothing by default; use
@@ -100,6 +142,8 @@ Geometric-flow runs print extra diagnostics:
 - `g`: mean and standard deviation of the learned metric field.
 - `|k|`: mean absolute curvature.
 - `step`: learned residual flow step size.
+- `transport`: low-rank channel transport strength, for V2.
+- `lap`: average absolute Laplacian response, for V2.
 
 All randomness is fixed by default: Python, Torch, CUDA/cuDNN deterministic
 settings, synthetic sample generation, dataset split, and DataLoader shuffling
