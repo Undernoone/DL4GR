@@ -5,8 +5,7 @@ hackable demo for the idea:
 
     data/task -> local metric G(h) -> distances/logits in curved feature space
 
-The dataset is synthetic and generated locally. Each image contains one of four
-simple geometric patterns with random shifts, thickness, and noise.
+The script supports synthetic data plus public torchvision datasets.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 
 class SyntheticPatternDataset(Dataset):
@@ -96,20 +95,30 @@ class SyntheticPatternDataset(Dataset):
             img[rows, shifted_cols] = 1.0
 
 
+@dataclass(frozen=True)
+class DataConfig:
+    classes: int
+    input_channels: int
+
+
 class ConvEncoder(nn.Module):
-    def __init__(self, feature_dim: int = 64) -> None:
+    def __init__(self, input_channels: int = 1, feature_dim: int = 64) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.Conv2d(input_channels, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((4, 4)),
             nn.Flatten(),
-            nn.Linear(32 * 7 * 7, feature_dim),
+            nn.Linear(128 * 4 * 4, feature_dim),
             nn.ReLU(inplace=True),
         )
 
@@ -120,9 +129,14 @@ class ConvEncoder(nn.Module):
 class TraditionalCNN(nn.Module):
     """Plain CNN encoder plus a linear classifier."""
 
-    def __init__(self, feature_dim: int = 64, classes: int = 4) -> None:
+    def __init__(
+        self,
+        input_channels: int = 1,
+        feature_dim: int = 64,
+        classes: int = 4,
+    ) -> None:
         super().__init__()
-        self.encoder = ConvEncoder(feature_dim)
+        self.encoder = ConvEncoder(input_channels, feature_dim)
         self.classifier = nn.Linear(feature_dim, classes)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -161,9 +175,14 @@ class CurvedMetricHead(nn.Module):
 class CurvedMetricCNN(nn.Module):
     """Same encoder, but classification happens in a learned local metric."""
 
-    def __init__(self, feature_dim: int = 64, classes: int = 4) -> None:
+    def __init__(
+        self,
+        input_channels: int = 1,
+        feature_dim: int = 64,
+        classes: int = 4,
+    ) -> None:
         super().__init__()
-        self.encoder = ConvEncoder(feature_dim)
+        self.encoder = ConvEncoder(input_channels, feature_dim)
         self.head = CurvedMetricHead(feature_dim, classes)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -301,7 +320,15 @@ def maybe_save_metrics(results: Dict[str, List[Dict[str, float]]], output_path: 
     print(f"Saved metrics to {path}")
 
 
-def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
+def deterministic_subset(dataset: Dataset, limit: int | None, seed: int) -> Dataset:
+    if limit is None or limit >= len(dataset):
+        return dataset
+    generator = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(len(dataset), generator=generator)[:limit].tolist()
+    return Subset(dataset, indices)
+
+
+def build_synthetic_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset, DataConfig]:
     dataset = SyntheticPatternDataset(
         samples=args.samples,
         noise_std=args.noise,
@@ -311,6 +338,68 @@ def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
     test_size = len(dataset) - train_size
     split_generator = torch.Generator().manual_seed(args.seed + 101)
     train_set, test_set = random_split(dataset, [train_size, test_size], generator=split_generator)
+    return train_set, test_set, DataConfig(classes=4, input_channels=1)
+
+
+def build_public_datasets(args: argparse.Namespace) -> Tuple[Dataset, Dataset, DataConfig]:
+    from torchvision import datasets, transforms
+
+    dataset_name = args.dataset.lower()
+    data_root = Path(args.data_dir)
+
+    if dataset_name == "mnist":
+        transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.1307,), (0.3081,)),
+            ]
+        )
+        train_set = datasets.MNIST(data_root, train=True, download=args.download, transform=transform)
+        test_set = datasets.MNIST(data_root, train=False, download=args.download, transform=transform)
+        config = DataConfig(classes=10, input_channels=1)
+    elif dataset_name == "fashion-mnist":
+        transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.2860,), (0.3530,)),
+            ]
+        )
+        train_set = datasets.FashionMNIST(
+            data_root,
+            train=True,
+            download=args.download,
+            transform=transform,
+        )
+        test_set = datasets.FashionMNIST(
+            data_root,
+            train=False,
+            download=args.download,
+            transform=transform,
+        )
+        config = DataConfig(classes=10, input_channels=1)
+    elif dataset_name == "cifar10":
+        transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)),
+            ]
+        )
+        train_set = datasets.CIFAR10(data_root, train=True, download=args.download, transform=transform)
+        test_set = datasets.CIFAR10(data_root, train=False, download=args.download, transform=transform)
+        config = DataConfig(classes=10, input_channels=3)
+    else:
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
+
+    train_set = deterministic_subset(train_set, args.train_samples, args.seed + 401)
+    test_set = deterministic_subset(test_set, args.test_samples, args.seed + 402)
+    return train_set, test_set, config
+
+
+def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader, DataConfig]:
+    if args.dataset == "synthetic":
+        train_set, test_set, config = build_synthetic_datasets(args)
+    else:
+        train_set, test_set, config = build_public_datasets(args)
 
     train_generator = torch.Generator().manual_seed(args.seed + 202)
     test_generator = torch.Generator().manual_seed(args.seed + 303)
@@ -330,13 +419,23 @@ def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
         worker_init_fn=seed_worker,
         generator=test_generator,
     )
-    return train_loader, test_loader
+    return train_loader, test_loader, config
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="mnist",
+        choices=["synthetic", "mnist", "fashion-mnist", "cifar10"],
+    )
+    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--samples", type=int, default=4000)
+    parser.add_argument("--train-samples", type=int, default=None)
+    parser.add_argument("--test-samples", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--feature-dim", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-3)
@@ -369,18 +468,20 @@ def main() -> None:
     set_seed(args.seed)
     device = choose_device(args.device)
 
-    model_builders = {
-        "Traditional CNN": lambda: TraditionalCNN(feature_dim=args.feature_dim),
-        "Curved Metric CNN": lambda: CurvedMetricCNN(feature_dim=args.feature_dim),
-    }
-
     results = {}
-    for name, build_model in model_builders.items():
+    for name, model_cls in {
+        "Traditional CNN": TraditionalCNN,
+        "Curved Metric CNN": CurvedMetricCNN,
+    }.items():
         set_seed(args.seed)
-        train_loader, test_loader = build_loaders(args)
+        train_loader, test_loader, data_config = build_loaders(args)
         results[name] = train_model(
             name=name,
-            model=build_model(),
+            model=model_cls(
+                input_channels=data_config.input_channels,
+                feature_dim=args.feature_dim,
+                classes=data_config.classes,
+            ),
             train_loader=train_loader,
             test_loader=test_loader,
             epochs=args.epochs,

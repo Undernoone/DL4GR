@@ -2,7 +2,8 @@
 
 This repository contains a small experiment for comparing a normal CNN with a
 CNN that uses a learnable local metric, inspired by the idea that representation
-space can be curved instead of fixed and flat.
+space can be curved instead of fixed and flat. It supports public torchvision
+datasets as well as a tiny synthetic smoke-test dataset.
 
 The demo is intentionally lightweight:
 
@@ -33,16 +34,30 @@ python3 -m pip install -r requirements.txt
 Run the comparison:
 
 ```bash
-python3 experiments/curved_cnn_demo.py --epochs 8 --seed 7
+python3 experiments/curved_cnn_demo.py --dataset mnist --epochs 8 --seed 7
 ```
 
-The script uses a synthetic image dataset, so it does not need internet access
-or external data downloads.
+Supported datasets:
+
+- `mnist`
+- `fashion-mnist`
+- `cifar10`
+- `synthetic`
+
+Public datasets are downloaded to `data/` by default. Use `--no-download` if
+the dataset already exists on the server and the run should not touch the
+network.
 
 Optional plot:
 
 ```bash
-python3 experiments/curved_cnn_demo.py --epochs 8 --plot outputs/curved_cnn.png
+python3 experiments/curved_cnn_demo.py \
+  --dataset cifar10 \
+  --device cuda \
+  --epochs 30 \
+  --seed 7 \
+  --metrics-json outputs/cifar10_metrics.json \
+  --plot outputs/cifar10_curved_cnn.png
 ```
 
 All randomness is fixed by default: Python, Torch, CUDA/cuDNN deterministic
